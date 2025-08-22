@@ -118,6 +118,9 @@ bot.onText(/\/balance/, async (msg) => {
 const app = express();
 app.use(express.json());
 
+// setelah: const app = express();
+app.use(express.json());
+
 // --- API: leaderboard
 app.get("/api/top", async (_req, res) => {
   try {
@@ -126,7 +129,14 @@ app.get("/api/top", async (_req, res) => {
     res.status(500).json({ ok: false });
   }
 });
+// setelah: const app = express();
+app.use(express.json());
 
+// handle webhook telegram
+app.post("/", (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
 // --- API: daily (1x/24h)
 app.post("/api/daily", async (req, res) => {
   try {
