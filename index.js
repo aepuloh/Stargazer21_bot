@@ -56,22 +56,20 @@ async function updatePoints(user_id, pts) {
 // ================= BOT SETUP (POLLING) =================
 const bot = new TelegramBot(TOKEN, { polling: true });
 
+// 🚀 Set tombol menu "Open" permanen di bawah chat
+bot.setChatMenuButton({
+  menu_button: {
+    type: "web_app",
+    text: "Open",
+    web_app: { url: `https://${BASE_HOST}/game` }
+  }
+});
+
 // ================= COMMANDS =================
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
   await addUser(chatId);
-  bot.sendMessage(chatId, "👋 Selamat datang di Pirate Slot!\n\nGunakan /game untuk main 🎮\nGunakan /balance untuk cek saldo 💰");
-});
-
-bot.onText(/\/game/, (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId, "🎮 Main Pirate Slot Game:", {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🚀 Open Game", web_app: { url: `https://${BASE_HOST}/game` } }]
-      ]
-    }
-  });
+  bot.sendMessage(chatId, "👋 Welcome to Pirate Slot!\nTekan tombol **Open** di bawah untuk mulai main 🎮\nGunakan /balance untuk cek saldo 💰");
 });
 
 bot.onText(/\/balance/, async (msg) => {
