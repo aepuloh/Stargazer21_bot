@@ -53,20 +53,14 @@ async function updatePoints(user_id, pts) {
   );
 }
 
-// ================= BOT SETUP =================
-const bot = new TelegramBot(TOKEN, { webHook: true });
-bot.setWebHook(`https://${BASE_HOST}/bot${TOKEN}`);
-
-app.post(`/bot${TOKEN}`, (req, res) => {
-  bot.processUpdate(req.body);
-  res.sendStatus(200);
-});
+// ================= BOT SETUP (POLLING) =================
+const bot = new TelegramBot(TOKEN, { polling: true });
 
 // ================= COMMANDS =================
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
   await addUser(chatId);
-  bot.sendMessage(chatId, "👋 Selamat datang di Pirate Slot!\n\nGunakan /game untuk main 🎮");
+  bot.sendMessage(chatId, "👋 Selamat datang di Pirate Slot!\n\nGunakan /game untuk main 🎮\nGunakan /balance untuk cek saldo 💰");
 });
 
 bot.onText(/\/game/, (msg) => {
@@ -153,7 +147,6 @@ const gameHTML = `
 </html>
 `;
 
-// Endpoint untuk Mini App
 app.get("/game", (req, res) => {
   res.type("html").send(gameHTML);
 });
