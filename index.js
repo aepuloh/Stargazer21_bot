@@ -8,7 +8,7 @@ const { Pool } = require("pg");
 
 // ===== ENV =====
 const TOKEN = process.env.BOT_TOKEN;
-const PUBLIC_URL = process.env.PUBLIC_URL; // e.g. https://your-app.up.railway.app
+const PUBLIC_URL = process.env.RAILWAY_PUBLIC_DOMAIN; // e.g. https://your-app.up.railway.app
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "change-me";
 
@@ -18,7 +18,7 @@ const Z_POPUP  = process.env.MONETAG_POPUP    || Z_REWARD;
 const Z_INTER  = process.env.MONETAG_INTER    || Z_REWARD;
 
 if (!TOKEN || !PUBLIC_URL || !process.env.DATABASE_URL) {
-  console.error("❌ Wajib set BOT_TOKEN, PUBLIC_URL, DATABASE_URL di .env");
+  console.error("❌ Wajib set BOT_TOKEN, RAILWAY_PUBLIC_,DOMAIN, DATABASE_URL di .env");
   process.exit(1);
 }
 
