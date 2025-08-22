@@ -56,15 +56,17 @@ async function updatePoints(user_id, pts) {
 // ================= BOT SETUP (POLLING) =================
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-// 🚀 Set tombol menu "Open" permanen di bawah chat
+// 🚀 Set tombol menu "Open" global untuk semua user
 bot.setChatMenuButton({
+  chat_id: 0, // 0 = default global
   menu_button: {
     type: "web_app",
     text: "Open",
     web_app: { url: `https://${BASE_HOST}/game` }
   }
-});
-
+})
+  .then(() => console.log("✅ Global menu button set"))
+  .catch(console.error);
 // ================= COMMANDS =================
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
