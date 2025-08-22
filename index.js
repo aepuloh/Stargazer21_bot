@@ -61,10 +61,12 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 bot.setChatMenuButton({
   menu_button: {
     type: "web_app",
-    text: "Open",
-    web_app: { url: `https://${BASE_HOST}/game` }
+    text: "Buka",
+    web_app: { url: "https://stargazer21bot-production.up.railway.app/game" }
   }
 })
+  .then(() => console.log("✅ Menu button diarahkan ke /game"))
+  .catch(console.error);
   .then(() => console.log("✅ Global menu button berhasil di-set"))
   .catch(console.error);
 
