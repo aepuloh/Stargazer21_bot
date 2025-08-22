@@ -1,11 +1,8 @@
 {
   "name": "pirate-slot-bot",
   "version": "1.0.0",
-  "description": "Telegram Pirate Slot Bot + Mini App",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "axios": "^1.6.8",
     "express": "^4.19.2",
