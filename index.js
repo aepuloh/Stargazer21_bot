@@ -10,8 +10,6 @@ const { Pool } = require("pg");
 const TOKEN = process.env.BOT_TOKEN;
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "change-me";
-
-// Railway public URL fallback
 const PUBLIC_URL =
   process.env.PUBLIC_URL ||
   (process.env.RAILWAY_PUBLIC_DOMAIN
@@ -110,7 +108,7 @@ bot.onText(/\/start/, async (msg) => {
 bot.onText(/\/balance/, async (msg) => {
   try {
     const u = await getUser(msg.chat.id);
-    bot.sendMessage(msg.chat.id, `💰 Balance: ${u.points} PIR`);
+    bot.sendMessage(msg.chat.id, `💰 Balance: ${u.points}`);
   } catch {
     bot.sendMessage(msg.chat.id, "⚠️ Gagal ambil balance.");
   }
@@ -151,20 +149,24 @@ app.post("/api/daily", async (req, res) => {
   }
 });
 
-// Reward (setelah ads/slot)
+// Reward (setelah ads/slot) + counter internal
 app.post("/api/reward", async (req, res) => {
   try {
     const { user_id, amount, source } = req.body || {};
     if (!user_id || !amount)
       return res.status(400).json({ ok: false, error: "bad params" });
     const updated = await addPoints(user_id, parseInt(amount, 10));
+    console.log(
+      `🎯 Reward diberikan: user=${user_id}, amount=${amount}, source=${source}`
+    );
     res.json({ ok: true, balance: updated.points, source });
-  } catch {
+  } catch (e) {
+    console.error("❌ Reward error:", e);
     res.status(500).json({ ok: false });
   }
 });
 
-// ===== Admin (simple) =====
+// ===== Admin (optional) =====
 app.get("/admin/add", async (req, res) => {
   const { user, amt, key } = req.query;
   if (key !== ADMIN_KEY) return res.status(403).send("❌ Unauthorized");
@@ -205,7 +207,7 @@ app.get("/admin/top", async (req, res) => {
   }
 });
 
-// ===== MiniApp UI (Full: Tasks/Ads + Daily + Leaders + Slot + Tabbar)
+// ===== MiniApp UI (Full Monetag + Daily + Leaders + Slot + Counter) =====
 app.get("/game", (_req, res) => {
   res.type("html").send(`<!doctype html>
 <html>
@@ -215,7 +217,7 @@ app.get("/game", (_req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
 
-  <!-- Monetag SDK (tiga zona) -->
+  <!-- Monetag SDK (3 zones) -->
   <script src='//libtl.com/sdk.js' data-zone='${process.env.MONETAG_REWARDED || ""}' data-sdk='show_${process.env.MONETAG_REWARDED || ""}'></script>
   <script src='//libtl.com/sdk.js' data-zone='${process.env.MONETAG_POPUP || ""}' data-sdk='show_${process.env.MONETAG_POPUP || ""}'></script>
   <script src='//libtl.com/sdk.js' data-zone='${process.env.MONETAG_INTER || ""}' data-sdk='show_${process.env.MONETAG_INTER || ""}'></script>
@@ -241,6 +243,8 @@ app.get("/game", (_req, res) => {
     .slot{display:flex;gap:10px;justify-content:center;margin:12px 0}
     .reel{width:78px;height:78px;background:#0f0f14;border:1px solid #2a2a33;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:42px}
     .purple{background:#3c2f92}
+    .stat{display:flex;gap:10px;flex-wrap:wrap}
+    .pill{background:#1a1a22;border:1px solid #262633;border-radius:999px;padding:6px 10px;font-size:12px}
   </style>
 </head>
 <body>
@@ -270,7 +274,7 @@ app.get("/game", (_req, res) => {
 
       <div class="section">
         <div class="title">Daily</div>
-        <div class="sub">After time actions</div>
+        <div class="sub">Once every 24h</div>
         <div class="center"><button class="btn" id="btn-daily">Claim daily (+10)</button></div>
         <div class="sub" id="daily-status"></div>
       </div>
@@ -279,6 +283,17 @@ app.get("/game", (_req, res) => {
         <div class="title">👀 Watch video</div>
         <div class="sub">In-App Interstitial</div>
         <div class="center"><button class="claim" id="btn-inter">Play</button></div>
+      </div>
+
+      <div class="section">
+        <div class="title">Session stats</div>
+        <div class="stat">
+          <div class="pill">Rewarded: <b id="c-rewarded">0</b></div>
+          <div class="pill">Popup: <b id="c-popup">0</b></div>
+          <div class="pill">Interstitial: <b id="c-inter">0</b></div>
+          <div class="pill">Slot wins: <b id="c-slot">0</b></div>
+          <div class="pill">Balance (server): <b id="c-balance">?</b></div>
+        </div>
       </div>
     </div>
 
@@ -323,6 +338,16 @@ app.get("/game", (_req, res) => {
     const userId = tg.initDataUnsafe?.user?.id;
     const post = (u,d)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json());
 
+    const counters = { rewarded:0, popup:0, inter:0, slot:0, balance:null };
+    const el = (id)=>document.getElementById(id);
+    const syncCounters = ()=>{
+      el("c-rewarded").textContent=counters.rewarded;
+      el("c-popup").textContent=counters.popup;
+      el("c-inter").textContent=counters.inter;
+      el("c-slot").textContent=counters.slot;
+      el("c-balance").textContent=(counters.balance==null?"?":counters.balance);
+    };
+
     function switchTab(key){
       ["home","leaders","all","games"].forEach(k=>{
         document.getElementById("page-"+k).classList.toggle("active", k===key);
@@ -332,31 +357,42 @@ app.get("/game", (_req, res) => {
     }
 
     async function loadLeaders(){
-      const el=document.getElementById("leaders");
-      el.textContent="Loading…";
+      const elL=document.getElementById("leaders");
+      elL.textContent="Loading…";
       try{
         const r=await fetch("/api/top").then(r=>r.json());
-        el.innerHTML=(r||[]).map((u,i)=> (i+1)+". "+u.user_id+" — <b>"+u.points+"</b>").join("<br>");
-      }catch(e){ el.textContent="⚠️ Failed"; }
+        elL.innerHTML=(r||[]).map((u,i)=> (i+1)+". "+u.user_id+" — <b>"+u.points+"</b>").join("<br>");
+      }catch(e){ elL.textContent="⚠️ Failed"; }
     }
 
     // Daily
-    document.getElementById("btn-daily").onclick = async ()=>{
+    el("btn-daily").onclick = async ()=>{
       if(!userId) return alert("Open from Telegram");
       const r = await post("/api/daily",{ user_id:userId });
-      if(r.ok){ document.getElementById("daily-status").textContent="✅ Claimed!"; tg.HapticFeedback?.notificationOccurred?.("success"); }
-      else if(r.next){ document.getElementById("daily-status").textContent="Next: "+new Date(r.next).toLocaleString(); }
-      else { document.getElementById("daily-status").textContent="⚠️ Try later"; }
+      if(r.ok){
+        el("daily-status").textContent="✅ Claimed!";
+        counters.balance = r.balance; syncCounters();
+        tg.HapticFeedback?.notificationOccurred?.("success");
+      } else if(r.next){
+        el("daily-status").textContent="Next: "+new Date(r.next).toLocaleString();
+      } else {
+        el("daily-status").textContent="⚠️ Try later";
+      }
     };
 
-    // Reward helper
+    // Reward helper (internal counter + server add)
     async function reward(amount, source){
       if(!userId) return alert("Open from Telegram");
-      try{ await post("/api/reward",{ user_id:userId, amount, source }); }catch(e){}
+      try{
+        const r = await post("/api/reward",{ user_id:userId, amount, source });
+        if(r.ok){ counters.balance = r.balance; }
+      }catch(e){}
+      counters[source] = (counters[source]||0)+1;
+      syncCounters();
       tg.HapticFeedback?.notificationOccurred?.("success");
     }
 
-    // Monetag helper (graceful fallback)
+    // Monetag helper (graceful fallback in case SDK gagal)
     function callMonetag(zone, fbMs, onOk){
       if(!zone){ setTimeout(onOk, fbMs); return; }
       const fn="show_"+zone;
@@ -371,17 +407,17 @@ app.get("/game", (_req, res) => {
       }catch(e){ setTimeout(onOk, fbMs); }
     }
 
-    document.getElementById("btn-rewarded").onclick = ()=>callMonetag("${process.env.MONETAG_REWARDED || ""}", 4000, ()=>reward(5,"rewarded"));
-    document.getElementById("btn-popup").onclick    = ()=>callMonetag("${process.env.MONETAG_POPUP || ""}",    3000, ()=>reward(5,"popup"));
-    document.getElementById("btn-inter").onclick    = ()=>callMonetag("${process.env.MONETAG_INTER || ""}",    3000, ()=>reward(3,"inter"));
+    el("btn-rewarded").onclick = ()=>callMonetag("${process.env.MONETAG_REWARDED || ""}", 4000, ()=>reward(5,"rewarded"));
+    el("btn-popup").onclick    = ()=>callMonetag("${process.env.MONETAG_POPUP || ""}",    3000, ()=>reward(5,"popup"));
+    el("btn-inter").onclick    = ()=>callMonetag("${process.env.MONETAG_INTER || ""}",    3000, ()=>reward(3,"inter"));
 
     // Slot
     let localBal = 10;
     const syms=["🍒","🍋","💎","⭐","7️⃣","⚓","🏴‍☠️"];
     const rand=()=> syms[Math.floor(Math.random()*syms.length)];
     const R=[document.getElementById("r1"),document.getElementById("r2"),document.getElementById("r3")];
-    document.getElementById("btn-spin").onclick=async ()=>{
-      if(localBal<1){ document.getElementById("slot-msg").textContent="Top up via tasks (watch ads)"; return; }
+    el("btn-spin").onclick=async ()=>{
+      if(localBal<1){ el("slot-msg").textContent="Top up via tasks (watch ads)"; return; }
       localBal--;
       const t=setInterval(()=>R.forEach(r=>r.textContent=rand()),90);
       setTimeout(()=>{
@@ -391,10 +427,13 @@ app.get("/game", (_req, res) => {
         let win=0,msg="No win";
         if(res[0]===res[1] && res[1]===res[2]){ win=(res[0]==="🏴‍☠️")?50:20; msg=(win===50?"3x Scatter! +50":"Triple! +20"); }
         else if(res.filter(x=>x==="🏴‍☠️").length===2){ win=10; msg="2x Scatter! +10"; }
-        if(win>0){ reward(win,"slot"); }
-        localBal+=win; document.getElementById("slot-msg").textContent=msg+" | Local: "+localBal;
+        if(win>0){ counters.slot++; reward(win,"slot"); }
+        localBal+=win; el("slot-msg").textContent=msg+" | Local: "+localBal;
       },1800);
     };
+
+    // init counter view
+    syncCounters();
   </script>
 </body>
 </html>`);
