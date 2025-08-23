@@ -1,12 +1,13 @@
-// MiniApp + Ads (Monetag) + Slot + Postgres (Railway Ready)
-// =========================================================
+// index.js
+// MiniApp + Monetag Ads + Full Slot (6x5 tumble-style, server-side) + Postgres (Railway ready)
+// =========================================================================================
 
 require("dotenv").config();
 const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const { Pool } = require("pg");
 
-// ===== ENV =====
+// ===== env / config =====
 const TOKEN = process.env.BOT_TOKEN;
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "change-me";
@@ -23,12 +24,13 @@ if (!TOKEN || !PUBLIC_URL || !process.env.DATABASE_URL) {
   process.exit(1);
 }
 
-// ===== DB (Postgres) =====
+// ===== Postgres pool =====
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
+// DB init
 (async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -43,6 +45,7 @@ const pool = new Pool({
   process.exit(1);
 });
 
+// ===== DB helpers =====
 async function getUser(user_id) {
   const q = await pool.query("SELECT * FROM users WHERE user_id=$1", [user_id]);
   if (q.rowCount === 0) {
@@ -77,10 +80,9 @@ async function topUsers(limit = 20) {
   return q.rows;
 }
 
-// ===== Bot (Polling) =====
+// ===== Telegram Bot (polling) =====
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-// tombol biru "Open" → /game
 bot
   .setChatMenuButton({
     menu_button: {
@@ -114,25 +116,25 @@ bot.onText(/\/balance/, async (msg) => {
   }
 });
 
-// ===== Web API =====
+// ===== Express App & APIs =====
 const app = express();
 app.use(express.json());
 
-// Leaderboard
+// Top leaderboard
 app.get("/api/top", async (_req, res) => {
   try {
     res.json(await topUsers());
-  } catch {
+  } catch (e) {
+    console.error("api/top err", e);
     res.status(500).json({ ok: false });
   }
 });
 
-// Daily (1x/24h)
+// Daily reward (1x24h)
 app.post("/api/daily", async (req, res) => {
   try {
     const { user_id } = req.body || {};
-    if (!user_id)
-      return res.status(400).json({ ok: false, error: "no user_id" });
+    if (!user_id) return res.status(400).json({ ok: false, error: "no user_id" });
     const u = await getUser(user_id);
     const now = new Date();
     const last = new Date(u.last_daily);
@@ -144,29 +146,139 @@ app.post("/api/daily", async (req, res) => {
     }
     const updated = await setDaily(user_id);
     res.json({ ok: true, reward: 10, balance: updated.points });
-  } catch {
+  } catch (e) {
+    console.error("api/daily err", e);
     res.status(500).json({ ok: false });
   }
 });
 
-// Reward (setelah ads/slot) + counter internal
+// Generic reward endpoint (ads, misc)
 app.post("/api/reward", async (req, res) => {
   try {
     const { user_id, amount, source } = req.body || {};
-    if (!user_id || !amount)
+    if (!user_id || typeof amount === "undefined")
       return res.status(400).json({ ok: false, error: "bad params" });
     const updated = await addPoints(user_id, parseInt(amount, 10));
-    console.log(
-      `🎯 Reward diberikan: user=${user_id}, amount=${amount}, source=${source}`
-    );
-    res.json({ ok: true, balance: updated.points, source });
+    console.log(`🎯 Reward diberikan: user=${user_id}, amount=${amount}, source=${source}`);
+    res.json({ ok: true, balance: updated.points });
   } catch (e) {
-    console.error("❌ Reward error:", e);
+    console.error("api/reward err", e);
     res.status(500).json({ ok: false });
   }
 });
 
-// ===== Admin (optional) =====
+// ===== Slot (server-side spin) =====
+// Basic rules:
+// - Grid 6 columns × 5 rows
+// - Pay-anywhere counts (counts of same symbol across grid) using paytable steps
+// - Random multiplier sometimes applied
+// - Scatter triggers extra coin reward (demo) — can be extended to free-spins logic
+app.post("/api/slot-spin", async (req, res) => {
+  try {
+    const { user_id, bet } = req.body || {};
+    const betVal = parseInt(bet, 10) || 10;
+    if (!user_id || !betVal) return res.status(400).json({ ok: false, error: "bad params" });
+
+    // ensure user exists and has enough points
+    const u = await getUser(user_id);
+    if (u.points < betVal) return res.json({ ok: false, error: "Saldo kurang" });
+
+    // debit bet
+    await addPoints(user_id, -betVal);
+
+    // RNG grid
+    const SYMBOLS = ["💎","👑","⚱️","🪙","🔱"]; // regular symbols
+    const SCATTER = "🗿";
+    const weights = SYMBOLS.length + 1; // equal chance including scatter (simple)
+    const randSymbol = () => {
+      const idx = Math.floor(Math.random() * weights);
+      return idx < SYMBOLS.length ? SYMBOLS[idx] : SCATTER;
+    };
+
+    const ROWS = 5, COLS = 6;
+    const grid = [];
+    for (let r = 0; r < ROWS; r++) {
+      const row = [];
+      for (let c = 0; c < COLS; c++) row.push(randSymbol());
+      grid.push(row);
+    }
+
+    // count symbols
+    const counts = {};
+    let scatters = 0;
+    for (const row of grid) {
+      for (const s of row) {
+        if (s === SCATTER) scatters++;
+        else counts[s] = (counts[s] || 0) + 1;
+      }
+    }
+
+    // paytable by counts (pay-anywhere)
+    const steps = [
+      { min: 21, mult: 50 },
+      { min: 16, mult: 25 },
+      { min: 14, mult: 10 },
+      { min: 12, mult: 5 },
+      { min: 10, mult: 2 },
+      { min: 8, mult: 1 },
+    ];
+
+    let baseWin = 0;
+    for (const sym in counts) {
+      const n = counts[sym];
+      for (const st of steps) {
+        if (n >= st.min) {
+          baseWin += st.mult * betVal;
+          break;
+        }
+      }
+    }
+
+    // Random multipliers (chance)
+    let multis = [];
+    if (Math.random() < 0.30) {
+      // maybe multiple chips
+      const possible = [2,3,4,5,6,7,8,10,12,15,20];
+      const count = Math.random() < 0.2 ? 2 : 1;
+      for (let i = 0; i < count; i++) {
+        multis.push(possible[Math.floor(Math.random() * possible.length)]);
+      }
+    }
+
+    // apply multipliers as percent addition (sum then +1)
+    let totalWin = baseWin;
+    if (multis.length > 0) {
+      const sumPerc = multis.reduce((s, x) => s + x, 0);
+      totalWin = Math.floor(totalWin * (1 + sumPerc / 100));
+    }
+
+    // scatter reward (demo): add a small coin reward for scatter hits
+    if (scatters >= 4) {
+      // reward in terms of bet multiples
+      totalWin += betVal * 5; // for demo: 5x bet
+    }
+
+    // credit win
+    if (totalWin > 0) {
+      await addPoints(user_id, totalWin);
+    }
+
+    const updated = await getUser(user_id);
+    res.json({
+      ok: true,
+      grid,
+      win: totalWin,
+      balance: updated.points,
+      multis,
+      scatters
+    });
+  } catch (e) {
+    console.error("❌ slot-spin error:", e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// ===== Admin helpers =====
 app.get("/admin/add", async (req, res) => {
   const { user, amt, key } = req.query;
   if (key !== ADMIN_KEY) return res.status(403).send("❌ Unauthorized");
@@ -174,18 +286,8 @@ app.get("/admin/add", async (req, res) => {
   try {
     const u = await addPoints(user, parseInt(amt, 10));
     res.send(`✅ User ${user} +${amt}, balance = ${u.points}`);
-  } catch {
-    res.status(500).send("❌ Error");
-  }
-});
-app.get("/admin/reset", async (req, res) => {
-  const { user, key } = req.query;
-  if (key !== ADMIN_KEY) return res.status(403).send("❌ Unauthorized");
-  if (!user) return res.send("⚠️ user required");
-  try {
-    await pool.query("UPDATE users SET points=0 WHERE user_id=$1", [user]);
-    res.send(`♻️ Reset balance user ${user} → 0`);
-  } catch {
+  } catch (e) {
+    console.error("admin/add err", e);
     res.status(500).send("❌ Error");
   }
 });
@@ -193,27 +295,25 @@ app.get("/admin/top", async (req, res) => {
   const { key } = req.query;
   if (key !== ADMIN_KEY) return res.status(403).send("❌ Unauthorized");
   try {
-    const rows = await topUsers(10);
+    const rows = await topUsers(20);
     res.send(
       "<h2>🏆 Top Users</h2>" +
-        rows
-          .map(
-            (u, i) => `${i + 1}. ${u.user_id} — <b>${u.points}</b>`
-          )
-          .join("<br>")
+        rows.map((u, i) => `${i + 1}. ${u.user_id} — <b>${u.points}</b>`).join("<br>")
     );
-  } catch {
+  } catch (e) {
+    console.error("admin/top err", e);
     res.status(500).send("❌ Error");
   }
 });
 
-// ===== MiniApp UI (Full Monetag + Daily + Leaders + Slot + Counter) =====
+// ===== MiniApp UI (merged) =====
+// The /game HTML contains: Tasks (ads), Daily, Session stats, Leaders, All tasks, Games (slot 6x5)
 app.get("/game", (_req, res) => {
   res.type("html").send(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>Your app — mini app</title>
+  <title>MiniApp — Tasks & Slot</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
 
@@ -225,7 +325,7 @@ app.get("/game", (_req, res) => {
   <style>
     *{box-sizing:border-box}
     body{margin:0;background:#0c0c10;color:#fff;font-family:system-ui,Roboto,Segoe UI,sans-serif}
-    .wrap{max-width:760px;margin:0 auto;padding:14px 14px 96px}
+    .wrap{max-width:860px;margin:0 auto;padding:14px 14px 96px}
     .section{background:#141419;border:1px solid #23232b;border-radius:16px;padding:16px;margin:14px 0}
     .title{font-weight:800;font-size:22px;margin:0 0 8px}
     .sub{opacity:.75;font-size:14px;margin:0 0 10px}
@@ -240,25 +340,26 @@ app.get("/game", (_req, res) => {
     .tab.active{opacity:1}
     .page{display:none}
     .page.active{display:block}
-    .slot{display:flex;gap:10px;justify-content:center;margin:12px 0}
-    .reel{width:78px;height:78px;background:#0f0f14;border:1px solid #2a2a33;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:42px}
-    .purple{background:#3c2f92}
-    .stat{display:flex;gap:10px;flex-wrap:wrap}
+    .slot-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin:12px 0}
+    .cell{background:#0f0f14;border:1px solid #23232b;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:28px;height:58px}
+    .controls{display:flex;gap:8px;justify-content:center;align-items:center;margin-top:8px}
     .pill{background:#1a1a22;border:1px solid #262633;border-radius:999px;padding:6px 10px;font-size:12px}
+    .muted{opacity:.7;font-size:13px}
+    .payinfo{font-size:13px;margin-top:8px;color:#bfc8d9}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <!-- HOME -->
+    <!-- HOME / TASKS -->
     <div id="page-home" class="page active">
       <div class="section">
         <div class="title">Tasks</div>
-        <div class="sub">Get rewards for actions</div>
+        <div class="sub">Get rewards for actions (ads integrated)</div>
 
         <div class="task">
           <div class="left">
             <div class="emoji">🤩</div>
-            <div><b>Watch short ads</b><div class="sub">Rewarded Interstitial</div></div>
+            <div><b>Watch rewarded ad</b><div class="sub">Rewarded zone</div></div>
           </div>
           <button class="claim" id="btn-rewarded">Claim</button>
         </div>
@@ -266,9 +367,17 @@ app.get("/game", (_req, res) => {
         <div class="task">
           <div class="left">
             <div class="emoji">😎</div>
-            <div><b>Click to get reward</b><div class="sub">Rewarded Popup</div></div>
+            <div><b>Popup reward</b><div class="sub">Popup zone</div></div>
           </div>
           <button class="claim" id="btn-popup">Claim</button>
+        </div>
+
+        <div class="task">
+          <div class="left">
+            <div class="emoji">👁️</div>
+            <div><b>Interstitial</b><div class="sub">In-app video</div></div>
+          </div>
+          <button class="claim" id="btn-inter">Play</button>
         </div>
       </div>
 
@@ -279,12 +388,6 @@ app.get("/game", (_req, res) => {
         <div class="sub" id="daily-status"></div>
       </div>
 
-      <div class="section purple">
-        <div class="title">👀 Watch video</div>
-        <div class="sub">In-App Interstitial</div>
-        <div class="center"><button class="claim" id="btn-inter">Play</button></div>
-      </div>
-
       <div class="section">
         <div class="title">Session stats</div>
         <div class="stat">
@@ -292,7 +395,7 @@ app.get("/game", (_req, res) => {
           <div class="pill">Popup: <b id="c-popup">0</b></div>
           <div class="pill">Interstitial: <b id="c-inter">0</b></div>
           <div class="pill">Slot wins: <b id="c-slot">0</b></div>
-          <div class="pill">Balance (server): <b id="c-balance">?</b></div>
+          <div class="pill">Balance: <b id="c-balance">?</b></div>
         </div>
       </div>
     </div>
@@ -305,7 +408,7 @@ app.get("/game", (_req, res) => {
       </div>
     </div>
 
-    <!-- ALL TASKS (placeholder) -->
+    <!-- ALL TASKS -->
     <div id="page-all" class="page">
       <div class="section center">
         <div class="title">All tasks</div>
@@ -314,14 +417,41 @@ app.get("/game", (_req, res) => {
       </div>
     </div>
 
-    <!-- GAMES -->
+    <!-- GAMES (SLOT 6x5) -->
     <div id="page-games" class="page">
       <div class="section center">
-        <div class="title">🎰 Pirate Slot</div>
-        <div class="sub">Spin & win</div>
-        <div class="slot"><div class="reel" id="r1">❓</div><div class="reel" id="r2">❓</div><div class="reel" id="r3">❓</div></div>
-        <button class="btn" id="btn-spin">🎰 Spin (–1)</button>
-        <div class="sub" id="slot-msg"></div>
+        <div class="title">🎰 Temple Thunder — Demo Slot (6×5)</div>
+        <div class="muted">Bet coins (not real money). Spin computed on server.</div>
+
+        <div style="margin-top:12px">
+          <div id="balance" class="sub">Balance: ?</div>
+
+          <div class="slot-grid" id="slot-grid" aria-hidden="true">
+            <!-- 6x5 cell placeholders will be injected -->
+          </div>
+
+          <div class="controls">
+            <label class="muted">Bet</label>
+            <select id="bet-select">
+              <option value="5">5</option>
+              <option value="10" selected>10</option>
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+
+            <button class="btn" id="spin-btn">SPIN</button>
+            <button class="btn" id="auto-btn">Auto: OFF</button>
+            <button class="btn" id="turbo-btn">Turbo: OFF</button>
+          </div>
+
+          <div id="slot-msg" class="sub" style="margin-top:10px"></div>
+
+          <div class="payinfo">
+            <div><b>Paytable (demo):</b> count same-symbol across grid → payouts by steps (8+:1× … 21+:50×). Scatter (🗿) 4+ gives bonus.</div>
+            <div style="margin-top:6px">Multipliers may appear randomly and boost win.</div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -329,120 +459,220 @@ app.get("/game", (_req, res) => {
   <div class="tabbar">
     <div class="tab active" id="tab-home" onclick="switchTab('home')">🏠<div>Home</div></div>
     <div class="tab" id="tab-leaders" onclick="switchTab('leaders')">❤️<div>Leaders</div></div>
-    <div class="tab" id="tab-all" onclick="switchTab('all')">🎁<div>All tasks</div></div>
+    <div class="tab" id="tab-all" onclick="switchTab('all')">🎁<div>All</div></div>
     <div class="tab" id="tab-games" onclick="switchTab('games')">🎮<div>Games</div></div>
   </div>
 
-  <script>
-    const tg = window.Telegram.WebApp; tg.expand();
-    const userId = tg.initDataUnsafe?.user?.id;
-    const post = (u,d)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json());
+<script>
+  // Telegram init
+  const tg = window.Telegram.WebApp;
+  try { tg.expand(); } catch(e){}
 
-    const counters = { rewarded:0, popup:0, inter:0, slot:0, balance:null };
-    const el = (id)=>document.getElementById(id);
-    const syncCounters = ()=>{
-      el("c-rewarded").textContent=counters.rewarded;
-      el("c-popup").textContent=counters.popup;
-      el("c-inter").textContent=counters.inter;
-      el("c-slot").textContent=counters.slot;
-      el("c-balance").textContent=(counters.balance==null?"?":counters.balance);
-    };
+  const userId = tg?.initDataUnsafe?.user?.id;
+  const post = (u, d) => fetch(u, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(d) }).then(r=>r.json());
 
-    function switchTab(key){
-      ["home","leaders","all","games"].forEach(k=>{
-        document.getElementById("page-"+k).classList.toggle("active", k===key);
-        document.getElementById("tab-"+k).classList.toggle("active", k===key);
-      });
-      if(key==="leaders") loadLeaders();
-    }
+  // session counters
+  const counters = { rewarded:0, popup:0, inter:0, slot:0, balance:null };
+  const ids = {
+    rewarded: "${process.env.MONETAG_REWARDED || ""}",
+    popup: "${process.env.MONETAG_POPUP || ""}",
+    inter: "${process.env.MONETAG_INTER || ""}"
+  };
 
-    async function loadLeaders(){
-      const elL=document.getElementById("leaders");
-      elL.textContent="Loading…";
-      try{
-        const r=await fetch("/api/top").then(r=>r.json());
-        elL.innerHTML=(r||[]).map((u,i)=> (i+1)+". "+u.user_id+" — <b>"+u.points+"</b>").join("<br>");
-      }catch(e){ elL.textContent="⚠️ Failed"; }
-    }
+  const el = id => document.getElementById(id);
+  function syncCounters(){
+    el("c-rewarded").textContent = counters.rewarded;
+    el("c-popup").textContent = counters.popup;
+    el("c-inter").textContent = counters.inter;
+    el("c-slot").textContent = counters.slot;
+    el("c-balance").textContent = (counters.balance == null ? "?" : counters.balance);
+    el("balance").textContent = "Balance: " + (counters.balance == null ? "?" : counters.balance);
+  }
 
-    // Daily
-    el("btn-daily").onclick = async ()=>{
-      if(!userId) return alert("Open from Telegram");
-      const r = await post("/api/daily",{ user_id:userId });
-      if(r.ok){
-        el("daily-status").textContent="✅ Claimed!";
-        counters.balance = r.balance; syncCounters();
-        tg.HapticFeedback?.notificationOccurred?.("success");
-      } else if(r.next){
-        el("daily-status").textContent="Next: "+new Date(r.next).toLocaleString();
-      } else {
-        el("daily-status").textContent="⚠️ Try later";
-      }
-    };
+  // Tab switch
+  function switchTab(key){
+    ["home","leaders","all","games"].forEach(k=>{
+      document.getElementById("page-"+k).classList.toggle("active", k===key);
+      document.getElementById("tab-"+k).classList.toggle("active", k===key);
+    });
+    if(key==="leaders") loadLeaders();
+  }
 
-    // Reward helper (internal counter + server add)
-    async function reward(amount, source){
-      if(!userId) return alert("Open from Telegram");
-      try{
-        const r = await post("/api/reward",{ user_id:userId, amount, source });
-        if(r.ok){ counters.balance = r.balance; }
-      }catch(e){}
-      counters[source] = (counters[source]||0)+1;
-      syncCounters();
-      tg.HapticFeedback?.notificationOccurred?.("success");
-    }
+  async function loadLeaders(){
+    const elL = el("leaders");
+    elL.textContent = "Loading…";
+    try {
+      const r = await fetch("/api/top").then(r=>r.json());
+      elL.innerHTML = (r||[]).map((u,i)=> (i+1) + ". " + u.user_id + " — <b>" + u.points + "</b>").join("<br>");
+    } catch(e) { elL.textContent = "⚠️ Failed"; }
+  }
 
-    // Monetag helper (graceful fallback in case SDK gagal)
-    function callMonetag(zone, fbMs, onOk){
-      if(!zone){ setTimeout(onOk, fbMs); return; }
-      const fn="show_"+zone;
-      try{
-        if(typeof window[fn]==="function"){
-          const p = window[fn]();
-          if(p && typeof p.then==="function"){ p.then(onOk).catch(()=>setTimeout(onOk, fbMs)); }
-          else { setTimeout(onOk, fbMs); }
-        }else{
-          setTimeout(onOk, fbMs);
-        }
-      }catch(e){ setTimeout(onOk, fbMs); }
-    }
+  // Monetag wrapper safe fallback
+  function callMonetag(zone, fallbackMs, onOk){
+    if(!zone){ setTimeout(onOk, fallbackMs); return; }
+    const fn = "show_" + zone;
+    try {
+      if(typeof window[fn] === "function"){
+        const p = window[fn]();
+        if(p && typeof p.then === "function"){ p.then(onOk).catch(()=>setTimeout(onOk, fallbackMs)); }
+        else setTimeout(onOk, fallbackMs);
+      } else setTimeout(onOk, fallbackMs);
+    } catch(e){ setTimeout(onOk, fallbackMs); }
+  }
 
-    el("btn-rewarded").onclick = ()=>callMonetag("${process.env.MONETAG_REWARDED || ""}", 4000, ()=>reward(5,"rewarded"));
-    el("btn-popup").onclick    = ()=>callMonetag("${process.env.MONETAG_POPUP || ""}",    3000, ()=>reward(5,"popup"));
-    el("btn-inter").onclick    = ()=>callMonetag("${process.env.MONETAG_INTER || ""}",    3000, ()=>reward(3,"inter"));
-
-    // Slot
-    let localBal = 10;
-    const syms=["🍒","🍋","💎","⭐","7️⃣","⚓","🏴‍☠️"];
-    const rand=()=> syms[Math.floor(Math.random()*syms.length)];
-    const R=[document.getElementById("r1"),document.getElementById("r2"),document.getElementById("r3")];
-    el("btn-spin").onclick=async ()=>{
-      if(localBal<1){ el("slot-msg").textContent="Top up via tasks (watch ads)"; return; }
-      localBal--;
-      const t=setInterval(()=>R.forEach(r=>r.textContent=rand()),90);
-      setTimeout(()=>{
-        clearInterval(t);
-        const res=[rand(),rand(),rand()];
-        R.forEach((r,i)=>r.textContent=res[i]);
-        let win=0,msg="No win";
-        if(res[0]===res[1] && res[1]===res[2]){ win=(res[0]==="🏴‍☠️")?50:20; msg=(win===50?"3x Scatter! +50":"Triple! +20"); }
-        else if(res.filter(x=>x==="🏴‍☠️").length===2){ win=10; msg="2x Scatter! +10"; }
-        if(win>0){ counters.slot++; reward(win,"slot"); }
-        localBal+=win; el("slot-msg").textContent=msg+" | Local: "+localBal;
-      },1800);
-    };
-
-    // init counter view
+  // Reward helpers
+  async function reward(amount, source){
+    if(!userId) { alert("Buka dari Telegram agar bisa simpan ke server"); return; }
+    try {
+      const r = await post("/api/reward", { user_id: userId, amount, source });
+      if(r.ok) counters.balance = r.balance;
+    } catch(e){}
+    counters[source] = (counters[source]||0) + 1;
     syncCounters();
-  </script>
+    try { tg.HapticFeedback?.notificationOccurred?.("success"); } catch(e){}
+  }
+
+  el("btn-rewarded").onclick = () => callMonetag(ids.rewarded, 4000, ()=>reward(5,"rewarded"));
+  el("btn-popup").onclick = () => callMonetag(ids.popup, 3000, ()=>reward(5,"popup"));
+  el("btn-inter").onclick = () => callMonetag(ids.inter, 3000, ()=>reward(3,"inter"));
+
+  // Daily
+  el("btn-daily").onclick = async () => {
+    if(!userId) return alert("Open dari Telegram");
+    const r = await post("/api/daily", { user_id: userId });
+    if(r.ok){
+      el("daily-status").textContent = "✅ Claimed!";
+      counters.balance = r.balance; syncCounters();
+      try { tg.HapticFeedback?.notificationOccurred?.("success"); } catch(e){}
+    } else if(r.next){
+      el("daily-status").textContent = "Next: " + new Date(r.next).toLocaleString();
+    } else {
+      el("daily-status").textContent = "⚠️ Try later";
+    }
+  };
+
+  // ===== Slot UI + logic (client) =====
+  const SLOT_ROWS = 5, SLOT_COLS = 6;
+  const slotGridEl = el("slot-grid");
+  const spinBtn = el("spin-btn");
+  const betSelect = el("bet-select");
+  const slotMsg = el("slot-msg");
+  const autoBtn = el("auto-btn");
+  const turboBtn = el("turbo-btn");
+
+  let autoOn = false, turboOn = false, spinning = false;
+
+  // build empty grid DOM
+  function buildEmptyGrid(){
+    slotGridEl.innerHTML = "";
+    for(let r=0;r<SLOT_ROWS;r++){
+      for(let c=0;c<SLOT_COLS;c++){
+        const d = document.createElement("div");
+        d.className = "cell";
+        d.textContent = "❓";
+        slotGridEl.appendChild(d);
+      }
+    }
+  }
+  buildEmptyGrid();
+
+  // helper display grid from server
+  function displayGrid(grid){
+    slotGridEl.innerHTML = "";
+    for(const row of grid){
+      for(const sym of row){
+        const d = document.createElement("div");
+        d.className = "cell";
+        d.textContent = sym;
+        slotGridEl.appendChild(d);
+      }
+    }
+  }
+
+  // update balance from server periodically (light sync)
+  async function refreshBalance(){
+    if(!userId) return;
+    try {
+      // we can reuse /api/top? no. Instead call /api/reward with amount 0 to get balance (cheap hack)
+      const r = await post("/api/reward", { user_id: userId, amount: 0, source: "sync" });
+      if(r.ok) { counters.balance = r.balance; syncCounters(); }
+    } catch(e){}
+  }
+
+  // spin action
+  async function doSpin(bet){
+    if(spinning) return;
+    if(!userId) return alert("Open dari Telegram supaya saldo tersimpan");
+    spinning = true;
+    spinBtn.disabled = true;
+    slotMsg.textContent = "Spinning…";
+    // small animation: randomize quickly
+    const cells = Array.from(document.querySelectorAll(".cell"));
+    const animInterval = setInterval(()=>{
+      cells.forEach(c => c.textContent = ["🍒","🍋","💎","⭐","7️⃣","⚓","🏴‍☠️"][Math.floor(Math.random()*7)]);
+    }, turboOn ? 40 : 90);
+
+    try {
+      const r = await post("/api/slot-spin", { user_id: userId, bet: bet });
+      clearInterval(animInterval);
+      if(!r.ok){
+        slotMsg.textContent = r.error || "Spin failed";
+      } else {
+        // show grid returned
+        displayGrid(r.grid);
+        slotMsg.textContent = "Win: " + r.win + (r.multis && r.multis.length ? (" | Multis: " + r.multis.join(",")) : "") + (r.scatters ? (" | Scatters: " + r.scatters) : "");
+        if(r.win > 0) {
+          counters.slot++; // increment slot win counter
+        }
+        counters.balance = r.balance;
+        syncCounters();
+      }
+    } catch(e){
+      clearInterval(animInterval);
+      slotMsg.textContent = "⚠️ Error saat spin";
+      console.error("spin err", e);
+    } finally {
+      spinning = false;
+      spinBtn.disabled = false;
+      if(autoOn) {
+        // small delay between auto spins
+        setTimeout(()=> doSpin(parseInt(betSelect.value,10)), turboOn ? 120 : 550);
+      }
+    }
+  }
+
+  spinBtn.onclick = () => doSpin(parseInt(betSelect.value,10));
+  autoBtn.onclick = () => {
+    autoOn = !autoOn;
+    autoBtn.textContent = "Auto: " + (autoOn ? "ON" : "OFF");
+    if(autoOn && !spinning) doSpin(parseInt(betSelect.value,10));
+  };
+  turboBtn.onclick = () => {
+    turboOn = !turboOn;
+    turboBtn.textContent = "Turbo: " + (turboOn ? "ON" : "OFF");
+  };
+
+  // quick sync on load
+  (async function init(){
+    syncCounters();
+    // try to sync balance on open
+    if(userId){
+      try {
+        await refreshBalance();
+      } catch(e){}
+    }
+  })();
+
+  // safe fallback: when reward endpoint called with amount=0 we'll receive balance (we used this minimal endpoint)
+  // Alternative: you can add a dedicated /api/balance endpoint if preferred.
+
+</script>
 </body>
 </html>`);
 });
 
-// Root health
-app.get("/", (_req, res) =>
-  res.send("🚀 MiniApp is running. Open via Telegram (tombol biru **Open**).")
-);
+// root health
+app.get("/", (_req, res) => res.send("🚀 MiniApp is running. Open via Telegram (tombol biru Open)."));
 
-// Start server
+// start server
 app.listen(PORT, () => console.log("✅ Server running on", PORT));
